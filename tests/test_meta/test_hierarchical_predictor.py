@@ -17,6 +17,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn_compat.utils.estimator_checks import parametrize_with_checks
 
 from sklego.meta import HierarchicalClassifier, HierarchicalRegressor
+from sklego.meta.hierarchical_predictor import _ConstantClassifier
 from tests.conftest import DATAFRAME_ARRAY_API_REASON, expect_array_api_failure
 
 frame_funcs = [pd.DataFrame, pl.DataFrame, pa.table]
@@ -241,3 +242,168 @@ def test_expected_output(meta_model, method, shrinkage, expected, frame_func):
     y_pred = select_pred(getattr(meta_model, method)(nw.to_native(X_test)))
 
     assert np.allclose(expected, y_pred)
+
+
+def make_partial_labels_dataset(frame_func=pd.DataFrame, labels=("a", "b", "c")):
+    """Dataset where the most granular groups do not all see the same labels.
+
+    - store S1 only ever sees `labels[0]` (single-class group)
+    - store S2 sees `labels[0]` and `labels[1]`
+    - store S3 sees `labels[0]` and `labels[1]`
+    - store S4 only ever sees `labels[2]` (single-class group)
+    """
+    n_per_store = 30
+    rng = np.random.default_rng(42)
+    target = (
+        [labels[0]] * n_per_store
+        + [labels[0]] * (n_per_store // 2)
+        + [labels[1]] * (n_per_store // 2)
+        + [labels[0]] * (n_per_store // 2)
+        + [labels[1]] * (n_per_store // 2)
+        + [labels[2]] * n_per_store
+    )
+    n = len(target)
+    data = {
+        "x_0": rng.normal(size=n),
+        "x_1": rng.normal(size=n),
+        "region": ["R1"] * (2 * n_per_store) + ["R2"] * (2 * n_per_store),
+        "store": ["S1"] * n_per_store + ["S2"] * n_per_store + ["S3"] * n_per_store + ["S4"] * n_per_store,
+    }
+    return frame_func(data), np.array(target), ["region", "store"]
+
+
+@pytest.mark.parametrize("frame_func", frame_funcs)
+@pytest.mark.parametrize(
+    "labels",
+    [
+        ("a", "b", "c"),  # string labels
+        (3, 8, 15),  # discontinuous integer labels, none of them a valid positional index
+    ],
+)
+@pytest.mark.parametrize("shrinkage", [None, "equal", "relative", "constant"])
+def test_classifier_partial_and_single_class_groups(frame_func, labels, shrinkage):
+    """Local models participate with their real class meanings in fallback/shrinkage, for any label type."""
+    X, y, groups = make_partial_labels_dataset(frame_func, labels)
+    model = HierarchicalClassifier(
+        estimator=LogisticRegression(max_iter=300),
+        groups=groups,
+        shrinkage=shrinkage,
+        shrinkage_kwargs={"alpha": 0.5} if shrinkage == "constant" else None,
+    ).fit(X, y)
+
+    global_classes = np.unique(y)
+    assert np.array_equal(model.classes_, global_classes)
+
+    proba = model.predict_proba(X)
+
+    # predict_proba always returns one column per global class, in the global `classes_` order
+    assert proba.shape == (len(y), len(global_classes))
+    assert np.allclose(proba.sum(axis=1), 1.0)
+    assert (proba >= 0).all()
+
+    # single-class groups hold a deterministic estimator on the real label, not fabricated samples
+    s1_estimator = model.estimators_[(1, "R1", "S1")]
+    s4_estimator = model.estimators_[(1, "R2", "S4")]
+    assert isinstance(s1_estimator, _ConstantClassifier)
+    assert isinstance(s4_estimator, _ConstantClassifier)
+    assert np.array_equal(s1_estimator.classes_, np.array([labels[0]]))
+    assert np.array_equal(s4_estimator.classes_, np.array([labels[2]]))
+
+    # without shrinkage, single-class leaves give a degenerate distribution on their single class
+    if shrinkage is None:
+        s1_rows = np.arange(len(y)) < 30
+        s4_rows = np.arange(len(y)) >= 90
+        assert np.allclose(proba[np.ix_(s1_rows, [0])], 1.0)
+        assert np.allclose(proba[np.ix_(s1_rows, [1, 2])], 0.0)
+        assert np.allclose(proba[np.ix_(s4_rows, [2])], 1.0)
+        assert np.allclose(proba[np.ix_(s4_rows, [0, 1])], 0.0)
+
+    # `predict` is the argmax of the blended probabilities and returns labels from the global `classes_`
+    preds = model.predict(X)
+    assert np.array_equal(preds, global_classes[np.argmax(proba, axis=1)])
+    assert set(np.unique(preds)).issubset(set(global_classes))
+
+
+@pytest.mark.parametrize("frame_func", frame_funcs)
+def test_predict_proba_unseen_local_classes_are_zero(frame_func):
+    """A class never seen by a local group contributes zero to that group's probability row."""
+    X, y, groups = make_partial_labels_dataset(frame_func)
+    model = HierarchicalClassifier(estimator=LogisticRegression(max_iter=300), groups=groups, shrinkage=None).fit(X, y)
+
+    proba = model.predict_proba(X)
+    class_ix = {label: ix for ix, label in enumerate(model.classes_)}
+
+    # S2 never sees 'c': its leaf-level prediction must put zero mass on the 'c' column
+    s2_rows = np.arange(30, 60)
+    assert np.allclose(proba[s2_rows, class_ix["c"]], 0.0)
+    # the remaining mass is distributed over the classes S2 actually saw ('a', 'b')
+    assert np.allclose(proba[np.ix_(s2_rows, [class_ix["a"], class_ix["b"]])].sum(axis=1), 1.0)
+
+
+@pytest.mark.parametrize("frame_func", frame_funcs)
+def test_stable_output_shape_and_row_order(frame_func):
+    """Querying one or many rows keeps the same number of columns and the input row order."""
+    X, y, groups = make_partial_labels_dataset(frame_func)
+    model = HierarchicalClassifier(LogisticRegression(max_iter=300), groups=groups).fit(X, y)
+
+    full_proba = model.predict_proba(X)
+    full_pred = model.predict(X)
+    n_classes = len(model.classes_)
+
+    # single-row query keeps a 2D probability matrix and 1D label array
+    single_row = nw.to_native(nw.from_native(X).head(1))
+    single_proba = model.predict_proba(single_row)
+    assert single_proba.shape == (1, n_classes)
+    assert model.predict(single_row).shape == (1,)
+
+    # shuffled inputs return outputs aligned to the shuffled row order
+    rng = np.random.default_rng(0)
+    perm = rng.permutation(len(y))
+    native_frame = nw.to_native(nw.from_native(X))
+    if hasattr(native_frame, "iloc"):
+        shuffled = native_frame.iloc[perm]
+    elif hasattr(native_frame, "take"):  # pyarrow Table
+        shuffled = native_frame.take(perm)
+    else:  # polars DataFrame
+        shuffled = native_frame[perm]
+    assert np.allclose(model.predict_proba(shuffled), full_proba[perm])
+    assert np.array_equal(model.predict(shuffled), full_pred[perm])
+
+
+def test_refit_does_not_keep_stale_classes():
+    """After a successful refit, attributes reflect only the new target's classes."""
+    X, y, groups = make_partial_labels_dataset(pd.DataFrame, labels=("a", "b", "c"))
+    model = HierarchicalClassifier(LogisticRegression(max_iter=300), groups=groups).fit(X, y)
+    assert np.array_equal(model.classes_, ["a", "b", "c"])
+
+    y_new = np.array([10, 20] * (len(y) // 2))
+    model.fit(X, y_new)
+
+    assert np.array_equal(model.classes_, [10, 20])
+    assert model.n_classes_ == 2
+    proba = model.predict_proba(X)
+    assert proba.shape == (len(y), 2)
+    assert np.allclose(proba.sum(axis=1), 1.0)
+    assert set(np.unique(model.predict(X))).issubset({10, 20})
+    # every stored estimator only knows classes of the new target
+    for estimator in model.estimators_.values():
+        assert set(np.asarray(estimator.classes_).tolist()).issubset({10, 20})
+
+
+@pytest.mark.parametrize("frame_func", frame_funcs)
+def test_parent_fallback_returns_full_global_probabilities(frame_func):
+    """Unseen groups fall back to parents and still get a complete, normalized global probability row."""
+    X, y, groups = make_partial_labels_dataset(frame_func)
+    model = HierarchicalClassifier(LogisticRegression(max_iter=300), groups=groups, fallback_method="parent").fit(X, y)
+
+    X_unseen = nw.to_native(
+        nw.from_native(X).with_columns(region=nw.lit("unknown_region"), store=nw.lit("unknown_store"))
+    )
+    proba = model.predict_proba(X_unseen)
+    assert proba.shape == (len(y), len(model.classes_))
+    assert np.allclose(proba.sum(axis=1), 1.0)
+
+    with pytest.raises(KeyError):
+        HierarchicalClassifier(LogisticRegression(max_iter=300), groups=groups, fallback_method="raise").fit(
+            X, y
+        ).predict_proba(X_unseen)

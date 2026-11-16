@@ -1,3 +1,4 @@
+from typing import ClassVar
 from warnings import warn
 
 import narwhals.stable.v1 as nw
@@ -65,6 +66,39 @@ def _get_estimator(estimators, grp_values, grp_names, return_level, fallback_met
 
         # fallback_method == "raise" case
         raise KeyError(f"No estimator found for the given group values: {grp_names}={grp_values}")
+
+
+class _ConstantClassifier:
+    """Deterministic classifier used for hierarchical groups whose training data contains a single class.
+
+    Many scikit-learn classifiers (e.g. `LogisticRegression`) cannot be fitted when only one class is present in the
+    training data. Instead of augmenting the data with fabricated samples of other classes, this estimator simply
+    records the single observed class and returns a degenerate probability distribution putting all the probability
+    mass on that class. It therefore preserves the *real* class meaning of the group while participating in the
+    parent fallback and shrinkage blending exactly like any other fitted estimator.
+
+    Attributes
+    ----------
+    classes_ : np.ndarray of shape (1,)
+        The single class observed in the group's training data.
+    """
+
+    classes_: ClassVar[np.ndarray]
+
+    def __init__(self, class_value):
+        self.classes_ = np.asarray([class_value])
+
+    def predict_proba(self, X):
+        """Return probability 1 for the single observed class, for every sample."""
+        return np.ones((len(X), 1), dtype=float)
+
+    def predict(self, X):
+        """Return the single observed class for every sample."""
+        return np.repeat(self.classes_, len(X))
+
+    def decision_function(self, X):
+        """Return a constant, maximal confidence score for every sample."""
+        return np.zeros((len(X), 1), dtype=float)
 
 
 class HierarchicalPredictor(ShrinkageMixin, MetaEstimatorMixin, BaseEstimator):
@@ -342,10 +376,12 @@ class HierarchicalPredictor(ShrinkageMixin, MetaEstimatorMixin, BaseEstimator):
         if not is_classifier(self.estimator):  # regressor or outlier detector
             n_out = 1
         else:
-            if self.n_classes_ > 2 or method_name == "predict_proba":
+            if method_name == "decision_function" and self.n_classes_ == 2:
+                n_out = 1  # binary case with `method_name = "decision_function"`
+            else:
+                # `predict_proba` always covers all global classes; multiclass `decision_function`
+                # is aligned on the global classes as well
                 n_out = self.n_classes_
-            else:  # binary case with `method_name = "decision_function"`
-                n_out = 1
 
         preds = np.zeros((X.shape[0], self.n_fitted_levels_, n_out), dtype=float)
         shrinkage = np.zeros((X.shape[0], self.n_fitted_levels_), dtype=float)
@@ -363,11 +399,27 @@ class HierarchicalPredictor(ShrinkageMixin, MetaEstimatorMixin, BaseEstimator):
                 )
                 _shrinkage_factor = self.shrinkage_factors_[grp_values[:_level]]
 
-                last_dim_ix = _estimator.classes_ if is_classifier(self.estimator) else [0]
                 X_grp_ = nw.to_native(grp_frame.drop([*self.groups_, self._INDEX_NAME]))
                 raw_pred = getattr(_estimator, method_name)(X_grp_)
 
-                preds[np.ix_(grp_idx, [level_idx], last_dim_ix)] = np.atleast_3d(raw_pred[:, None])
+                if is_classifier(self.estimator) and method_name == "predict_proba":
+                    # Map the estimator's local classes to their positions in the global `classes_`.
+                    # Local estimators may only know a subset of the global classes (e.g. single-class
+                    # groups); the columns of unseen classes simply keep their zero initialization, so
+                    # every row is returned with the full global probability vector. This works for any
+                    # label type (strings, discontinuous integers, ...), as labels are never used as
+                    # positional indices directly.
+                    last_dim_ix = np.searchsorted(self.classes_, _estimator.classes_)
+                    preds[np.ix_(grp_idx, [level_idx], last_dim_ix)] = np.atleast_3d(raw_pred[:, None])
+                elif is_classifier(self.estimator) and method_name == "decision_function" and n_out > 1:
+                    # Multiclass `decision_function` returns one column per local class, aligned on the
+                    # estimator's local `classes_`, hence the same global mapping as `predict_proba`.
+                    last_dim_ix = np.searchsorted(self.classes_, _estimator.classes_)
+                    preds[np.ix_(grp_idx, [level_idx], last_dim_ix)] = np.atleast_3d(raw_pred[:, None])
+                else:
+                    # Regression/outlier detection or binary `decision_function` (single output column).
+                    preds[np.ix_(grp_idx, [level_idx], np.arange(n_out))] = np.atleast_3d(raw_pred[:, None])
+
                 shrinkage[np.ix_(grp_idx)] = np.pad(
                     _shrinkage_factor,
                     (0, self.n_fitted_levels_ - len(_shrinkage_factor)),
@@ -375,7 +427,13 @@ class HierarchicalPredictor(ShrinkageMixin, MetaEstimatorMixin, BaseEstimator):
                     constant_values=(0),
                 )
 
-        return (preds * np.atleast_3d(shrinkage)).sum(axis=1).squeeze()
+        blended = (preds * np.atleast_3d(shrinkage)).sum(axis=1)
+
+        if is_classifier(self.estimator):
+            # Keep a stable 2D shape `(n_samples, n_out)`, also when predicting a single sample.
+            return blended
+        # Regression / outlier detection keep the historical squeezed output for compatibility.
+        return blended.squeeze()
 
     def _fit_single_estimator(self, grp_frame):
         """Shortcut to fit an estimator on a single group"""
@@ -567,6 +625,14 @@ class HierarchicalClassifier(ClassifierMixin, HierarchicalPredictor):
         The only way to blend the predictions of the group-level models is by using the probabilities of each class,
         and not the labels themselves.
 
+    !!! tip "Partial and single-class groups"
+
+        Local groups may only see a subset of the global labels, or even a single label. Labels of any type
+        (strings, discontinuous integers, ...) are supported: each local model participates in the parent fallback and
+        shrinkage blending according to the *real* classes it was fitted on, and `.predict_proba()` always returns one
+        column per global class, filling unseen classes with zeros. Single-class groups are handled by a deterministic
+        estimator that puts all the probability mass on the only observed class, without fabricating samples.
+
     !!! info "New in version 0.8.0"
 
     Examples
@@ -661,6 +727,28 @@ class HierarchicalClassifier(ClassifierMixin, HierarchicalPredictor):
 
         super().fit(X, y)
         return self
+
+    def _fit_single_estimator(self, grp_frame):
+        """Fit a classifier for one group.
+
+        Groups whose target contains a single class are handled by a deterministic
+        [`_ConstantClassifier`][sklego.meta.hierarchical_predictor._ConstantClassifier], which puts all the probability
+        mass on the only class observed in the group. This avoids estimators that cannot learn from a single class
+        (e.g. `LogisticRegression`) failing the whole fit, without fabricating samples of other classes. The group's
+        real class meaning is preserved, and the resulting estimator participates in parent fallback and shrinkage
+        like any other fitted estimator.
+        """
+        # Use the narwhals-native `unique()` so single-class detection works for every supported
+        # frame backend; `np.unique` falls back to sorting which pyarrow scalars do not support.
+        unique_y = grp_frame[self._TARGET_NAME].unique().to_numpy()
+        if len(unique_y) == 1:
+            # Normalize the class value against the global `classes_` so that backend-native scalars
+            # (e.g. pyarrow scalars) never leak into the stored estimator. `classes_` is built with
+            # `np.unique` and therefore contains plain numpy values of the label's canonical dtype.
+            class_value = self.classes_[np.searchsorted(self.classes_, unique_y[0])]
+            return _ConstantClassifier(class_value=class_value)
+
+        return super()._fit_single_estimator(grp_frame)
 
     def predict(self, X):
         """Predict class labels for samples in `X` as the class with the highest probability.
